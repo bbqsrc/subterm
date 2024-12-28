@@ -9,7 +9,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
-    sync::{mpsc, Mutex as TokioMutex},
+    sync::{mpsc, oneshot, Mutex as TokioMutex},
 };
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
@@ -76,6 +76,10 @@ pub struct SubprocessPool {
     return_tx: mpsc::Sender<SubprocessWrapper>,
     return_rx: TokioMutex<mpsc::Receiver<SubprocessWrapper>>,
     builder: Arc<dyn Fn() -> Command + Send + Sync>,
+    waiters: (
+        mpsc::Sender<oneshot::Sender<()>>,
+        TokioMutex<mpsc::Receiver<oneshot::Sender<()>>>,
+    ),
 }
 
 impl SubprocessPool {
@@ -86,6 +90,7 @@ impl SubprocessPool {
         max_size: usize,
     ) -> Result<Arc<Self>> {
         let (return_tx, return_rx) = mpsc::channel(max_size);
+        let (waiter_tx, waiter_rx) = mpsc::channel(max_size);
         let mut processes = VecDeque::with_capacity(max_size);
 
         let builder = Arc::new(builder);
@@ -103,12 +108,13 @@ impl SubprocessPool {
             active_count: Arc::new(AtomicUsize::new(0)),
             return_tx,
             return_rx: TokioMutex::new(return_rx),
+            waiters: (waiter_tx, TokioMutex::new(waiter_rx)),
         }))
     }
 
     /// Write a line to any available process in the pool.
     /// If no process is available, this will block until one becomes available.
-    pub async fn write_line(&self, input: &str) -> Result<()> {
+    pub async fn write_line(self: &Arc<Self>, input: &str) -> Result<()> {
         let mut process = self.acquire().await?;
         process.write_line(input).await?;
         Ok(())
@@ -116,23 +122,26 @@ impl SubprocessPool {
 
     /// Get a process from the pool for interactive use.
     /// Waits until a process becomes available if the pool is currently empty.
-    pub async fn acquire(&self) -> Result<PooledProcess> {
+    pub async fn acquire(self: &Arc<Self>) -> Result<PooledProcess> {
         loop {
-            // First check the active count
             let current = self.active_count.load(Ordering::SeqCst);
             if current >= self.max_size {
-                // Pool is full, wait and try again
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                // Create a oneshot channel for this waiter
+                let (notify_tx, notify_rx) = oneshot::channel();
+
+                // Queue ourselves
+                if self.waiters.0.send(notify_tx).await.is_ok() {
+                    // Wait for our turn
+                    let _ = notify_rx.await;
+                }
                 continue;
             }
 
-            // Try to increment the counter
             if self
                 .active_count
                 .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
-                // Someone else changed it, try again
                 continue;
             }
 
@@ -173,6 +182,7 @@ impl SubprocessPool {
                             process: Some(process),
                             return_tx: self.return_tx.clone(),
                             active_count: self.active_count.clone(),
+                            pool: self.clone(),
                         });
                     }
 
@@ -187,7 +197,6 @@ impl SubprocessPool {
 
             // No processes available, decrement counter and try again
             self.active_count.fetch_sub(1, Ordering::SeqCst);
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -225,23 +234,21 @@ pub struct PooledProcess {
     process: Option<SubprocessWrapper>,
     return_tx: mpsc::Sender<SubprocessWrapper>,
     active_count: Arc<AtomicUsize>,
+    pool: Arc<SubprocessPool>,
 }
 
 impl Drop for PooledProcess {
     fn drop(&mut self) {
-        // Take ownership of the process
-        let mut process = self.process.take().unwrap();
-
-        // Always decrement active count first
-        self.active_count.fetch_sub(1, Ordering::SeqCst);
-
-        // Only return process if it's still alive
-        if process.is_alive() {
-            // Try to return the process to the pool
-            if self.return_tx.try_send(process).is_err() {
-                // If we can't return it, just let it drop
-                tracing::error!("Failed to return process to pool");
+        if let Some(process) = self.process.take() {
+            if let Ok(()) = self.return_tx.try_send(process) {
+                // Try to notify a waiter if there is one
+                if let Ok(mut rx) = self.pool.waiters.1.try_lock() {
+                    if let Ok(waiter) = rx.try_recv() {
+                        let _ = waiter.send(());
+                    }
+                }
             }
+            self.active_count.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -694,5 +701,37 @@ mod tests {
     async fn test_pool_write_line() {
         let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
         assert!(pool.write_line("test").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_pool_high_contention() {
+        let pool = SubprocessPool::new(get_echo_binary, 4).await.unwrap();
+
+        // Spawn 100 concurrent tasks all trying to acquire
+        let tasks: Vec<_> = (0..100)
+            .map(|i| {
+                let pool = pool.clone();
+                tokio::spawn(async move {
+                    let mut process = pool.acquire().await.unwrap();
+                    // Write something unique to verify we got a valid process
+                    process.write_line(&format!("task_{}", i)).await.unwrap();
+                    let response = process.read_line().await.unwrap();
+                    assert_eq!(response.trim(), format!(">>task_{}", i));
+                    // Hold the process briefly to increase contention
+                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                })
+            })
+            .collect();
+
+        // Wait for all tasks to complete
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        // Verify pool is still in a good state
+        let mut process = pool.acquire().await.unwrap();
+        process.write_line("final_test").await.unwrap();
+        let response = process.read_line().await.unwrap();
+        assert_eq!(response.trim(), ">>final_test");
     }
 }
