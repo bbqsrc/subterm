@@ -171,7 +171,7 @@ impl SubprocessPool {
                     // Verify the process is still alive
                     if process.is_alive() {
                         return Ok(PooledProcess {
-                            process,
+                            process: Some(process),
                             return_tx: self.return_tx.clone(),
                             active_count: self.active_count.clone(),
                         });
@@ -223,7 +223,7 @@ impl SubprocessPool {
 }
 
 pub struct PooledProcess {
-    process: BasicSubprocessHandler,
+    process: Option<BasicSubprocessHandler>,
     return_tx: mpsc::Sender<BasicSubprocessHandler>,
     active_count: Arc<AtomicUsize>,
 }
@@ -231,10 +231,7 @@ pub struct PooledProcess {
 impl Drop for PooledProcess {
     fn drop(&mut self) {
         // Take ownership of the process
-        let mut process = std::mem::replace(
-            &mut self.process,
-            BasicSubprocessHandler::new("true", &[]).unwrap(),
-        );
+        let mut process = self.process.take().unwrap();
 
         // Always decrement active count first
         self.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -253,23 +250,34 @@ impl Drop for PooledProcess {
 #[async_trait]
 impl SubprocessHandler for PooledProcess {
     async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
-        self.process.write_bytes(input).await
+        let Some(process) = self.process.as_mut() else {
+            return Err(SubterminalError::ChannelSend);
+        };
+        process.write_bytes(input).await
     }
 
     async fn read_bytes(&mut self) -> Result<Vec<u8>> {
-        self.process.read_bytes().await
+        let Some(process) = self.process.as_mut() else {
+            return Err(SubterminalError::ChannelSend);
+        };
+        process.read_bytes().await
     }
 
     async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
-        self.process.read_bytes_until(delimiter).await
+        let Some(process) = self.process.as_mut() else {
+            return Err(SubterminalError::ChannelSend);
+        };
+        process.read_bytes_until(delimiter).await
     }
 
     fn is_alive(&mut self) -> bool {
-        self.process.is_alive()
+        self.process.as_mut().map(|x| x.is_alive()).unwrap_or(false)
     }
 
     fn close_stdin(&mut self) {
-        self.process.close_stdin()
+        if let Some(process) = self.process.as_mut() {
+            process.close_stdin()
+        }
     }
 }
 
