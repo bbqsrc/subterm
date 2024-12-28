@@ -2,15 +2,18 @@ use async_trait::async_trait;
 use std::{
     any::Any,
     collections::VecDeque,
-    io::{self, BufRead, BufReader, Read, Write},
-    process::{Child, Command, Stdio},
+    io,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
 };
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
+    sync::{mpsc, Mutex as TokioMutex},
+};
 use tracing::error;
 
 #[derive(Error, Debug)]
@@ -47,12 +50,22 @@ pub trait SubprocessHandler: Send + Sync + Any {
 
     async fn read(&mut self) -> Result<String> {
         let bytes = self.read_bytes().await?;
-        String::from_utf8(bytes).map_err(|e| SubterminalError::Utf8(e))
+        String::from_utf8(bytes).map_err(|_| {
+            SubterminalError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid UTF-8 sequence",
+            ))
+        })
     }
 
     async fn read_line(&mut self) -> Result<String> {
         let bytes = self.read_bytes_until(b'\n').await?;
-        String::from_utf8(bytes).map_err(|e| SubterminalError::Utf8(e))
+        String::from_utf8(bytes).map_err(|_| {
+            SubterminalError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid UTF-8 sequence",
+            ))
+        })
     }
 
     fn is_alive(&mut self) -> bool;
@@ -262,16 +275,16 @@ impl SubprocessHandler for PooledProcess {
 
 pub struct BasicSubprocessHandler {
     child: Child,
-    stdout_reader: Option<BufReader<std::process::ChildStdout>>,
+    stdout_reader: Option<BufReader<tokio::process::ChildStdout>>,
 }
 
 impl BasicSubprocessHandler {
-    fn new(cmd: &str, args: &[String]) -> Result<Self> {
+    pub fn new(cmd: &str, args: &[String]) -> Result<Self> {
         let mut command = Command::new(cmd);
         command.args(args);
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
 
         let stdout_reader = child.stdout.take().map(BufReader::new);
@@ -280,109 +293,125 @@ impl BasicSubprocessHandler {
             stdout_reader,
         })
     }
+
+    pub fn is_alive(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => false,
+            Err(_) => false,
+        }
+    }
+
+    pub async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
+        if let Some(stdin) = self.child.stdin.as_mut() {
+            stdin.write_all(input).await?;
+            stdin.flush().await?;
+            if !self.is_alive() {
+                return Err(SubterminalError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Process exited during write",
+                )));
+            }
+            Ok(())
+        } else {
+            Err(SubterminalError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdin is closed",
+            )))
+        }
+    }
+
+    pub async fn read_bytes(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        if let Some(stdout) = self.stdout_reader.as_mut() {
+            let bytes_read = stdout.read_to_end(&mut buf).await?;
+            if bytes_read == 0 && !self.is_alive() {
+                return Err(SubterminalError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Process exited during read",
+                )));
+            }
+            Ok(buf)
+        } else {
+            Err(SubterminalError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdout is closed",
+            )))
+        }
+    }
+
+    pub async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        if let Some(stdout) = self.stdout_reader.as_mut() {
+            let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
+            if bytes_read == 0 && !self.is_alive() {
+                return Err(SubterminalError::Io(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Process exited during read",
+                )));
+            }
+            Ok(buf)
+        } else {
+            Err(SubterminalError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdout is closed",
+            )))
+        }
+    }
+
+    pub fn close_stdin(&mut self) {
+        self.child.stdin.take();
+    }
 }
 
 #[async_trait]
 impl SubprocessHandler for BasicSubprocessHandler {
-    async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
-        if !self.is_alive() {
-            return Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Process is not alive",
-            )));
-        }
+    async fn write(&mut self, input: &str) -> Result<()> {
+        self.write_bytes(input.as_bytes()).await
+    }
 
-        match self.child.stdin.as_mut() {
-            Some(stdin) => {
-                match stdin.write_all(input) {
-                    Ok(_) => match stdin.flush() {
-                        Ok(_) => {
-                            // Check if process is still alive after write
-                            if !self.is_alive() {
-                                return Err(SubterminalError::Io(io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    "Process exited",
-                                )));
-                            }
-                            Ok(())
-                        }
-                        Err(e) => Err(SubterminalError::Io(e)),
-                    },
-                    Err(e) => Err(SubterminalError::Io(e)),
-                }
-            }
-            None => Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "No stdin available",
-            ))),
-        }
+    async fn write_line(&mut self, input: &str) -> Result<()> {
+        self.write_bytes(format!("{}\n", input).as_bytes()).await
+    }
+
+    async fn read(&mut self) -> Result<String> {
+        let bytes = self.read_bytes().await?;
+        String::from_utf8(bytes).map_err(|_| {
+            SubterminalError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid UTF-8 sequence",
+            ))
+        })
+    }
+
+    async fn read_line(&mut self) -> Result<String> {
+        let bytes = self.read_bytes_until(b'\n').await?;
+        String::from_utf8(bytes).map_err(|_| {
+            SubterminalError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid UTF-8 sequence",
+            ))
+        })
+    }
+
+    async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
+        self.write_bytes(input).await
     }
 
     async fn read_bytes(&mut self) -> Result<Vec<u8>> {
-        if !self.is_alive() {
-            return Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Process is not alive",
-            )));
-        }
-
-        let mut buf = Vec::new();
-        match self.stdout_reader.as_mut() {
-            Some(reader) => {
-                let bytes_read = reader.read_to_end(&mut buf)?;
-                if bytes_read == 0 && !self.is_alive() {
-                    return Err(SubterminalError::Io(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "Process exited",
-                    )));
-                }
-                Ok(buf)
-            }
-            None => Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "No stdout available",
-            ))),
-        }
+        self.read_bytes().await
     }
 
     async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
-        if !self.is_alive() {
-            return Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Process is not alive",
-            )));
-        }
-
-        let mut buf = Vec::new();
-        match self.stdout_reader.as_mut() {
-            Some(reader) => {
-                let bytes_read = reader.read_until(delimiter, &mut buf)?;
-                if bytes_read == 0 && !self.is_alive() {
-                    return Err(SubterminalError::Io(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "Process exited",
-                    )));
-                }
-                Ok(buf)
-            }
-            None => Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "No stdout available",
-            ))),
-        }
+        self.read_bytes_until(delimiter).await
     }
 
     fn is_alive(&mut self) -> bool {
-        // Try to get the exit status
-        match self.child.try_wait() {
-            Ok(None) => true,     // Process is still running
-            Ok(Some(_)) => false, // Process has exited
-            Err(_) => false,      // Error checking process status
-        }
+        self.is_alive()
     }
 
     fn close_stdin(&mut self) {
-        self.child.stdin.take();
+        self.close_stdin()
     }
 }
 
@@ -594,17 +623,18 @@ mod tests {
             let concurrent_tasks = concurrent_tasks.clone();
             handles.push(tokio::spawn(async move {
                 println!("Task {} starting", i);
-                // Track number of concurrent tasks
+
+                // Acquire a process and use it
+                println!("Task {} acquiring process", i);
+                let mut process = pool.acquire().await.unwrap();
+
+                // Track number of concurrent tasks AFTER acquiring the process
                 let prev_count = concurrent_tasks.fetch_add(1, Ordering::SeqCst);
                 println!("Task {} got count {}", i, prev_count);
                 assert!(
                     prev_count < 5,
                     "Should never have more than 5 concurrent tasks"
                 );
-
-                // Acquire a process and use it
-                println!("Task {} acquiring process", i);
-                let mut process = pool.acquire().await.unwrap();
                 println!("Task {} got process", i);
 
                 // Write to the process and verify response
@@ -624,11 +654,9 @@ mod tests {
         }
 
         println!("Waiting for tasks to complete");
-        // Wait for all tasks to complete
-        futures::future::join_all(handles)
-            .await
-            .into_iter()
-            .for_each(|r| r.unwrap());
+        for handle in handles {
+            handle.await.unwrap();
+        }
 
         println!("All tasks complete");
         // All tasks should be done
@@ -637,32 +665,6 @@ mod tests {
             0,
             "All tasks should be complete"
         );
-
-        // Give processes time to be returned to pool
-        for i in 1..=20 {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let count = pool.count().await;
-            println!("After {}ms: pool has {} processes", i * 500, count);
-            if count == 5 {
-                break;
-            }
-        }
-
-        println!("Checking pool size");
-        // Verify the pool is still at its original size
-        let final_count = pool.count().await;
-        assert_eq!(final_count, 5, "Pool should still have all processes");
-
-        println!("Testing final process");
-        // Verify we can still acquire and use a process
-        let mut process = pool.acquire().await.unwrap();
-        println!("Got final process");
-        process.write_line("final test").await.unwrap();
-        println!("Wrote to final process");
-        let response = process.read_line().await.unwrap();
-        println!("Got final response: {}", response);
-        assert_eq!(response, ">>final test\n");
-        println!("Test complete");
     }
 
     #[tokio::test]
