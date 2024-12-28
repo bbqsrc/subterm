@@ -11,7 +11,6 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, Mutex as TokioMutex},
 };
-use tracing::error;
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -241,7 +240,7 @@ impl Drop for PooledProcess {
             // Try to return the process to the pool
             if self.return_tx.try_send(process).is_err() {
                 // If we can't return it, just let it drop
-                error!("Failed to return process to pool");
+                tracing::error!("Failed to return process to pool");
             }
         }
     }
