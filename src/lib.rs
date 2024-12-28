@@ -112,14 +112,6 @@ impl SubprocessPool {
         }))
     }
 
-    /// Write a line to any available process in the pool.
-    /// If no process is available, this will block until one becomes available.
-    pub async fn write_line(self: &Arc<Self>, input: &str) -> Result<()> {
-        let mut process = self.acquire().await?;
-        process.write_line(input).await?;
-        Ok(())
-    }
-
     /// Get a process from the pool for interactive use.
     /// Waits until a process becomes available if the pool is currently empty.
     pub async fn acquire(self: &Arc<Self>) -> Result<PooledProcess> {
@@ -447,12 +439,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_write() {
-        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
-        assert!(pool.write_line("test").await.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_echo_interactive() {
         let pool = SubprocessPool::new(get_echo_binary, 1).await.unwrap();
 
@@ -695,12 +681,6 @@ mod tests {
         // Try to read - should fail since process exited
         let read_result = process.read_line().await;
         assert!(matches!(read_result, Err(_)));
-    }
-
-    #[tokio::test]
-    async fn test_pool_write_line() {
-        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
-        assert!(pool.write_line("test").await.is_ok());
     }
 
     #[tokio::test]
