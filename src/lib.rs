@@ -71,10 +71,10 @@ pub trait SubprocessHandler: Send {
 
 pub struct SubprocessPool {
     max_size: usize,
-    processes: TokioMutex<VecDeque<SubprocessWrapper>>,
+    processes: TokioMutex<VecDeque<Subprocess>>,
     active_count: Arc<AtomicUsize>,
-    return_tx: mpsc::Sender<SubprocessWrapper>,
-    return_rx: TokioMutex<mpsc::Receiver<SubprocessWrapper>>,
+    return_tx: mpsc::Sender<Subprocess>,
+    return_rx: TokioMutex<mpsc::Receiver<Subprocess>>,
     builder: Arc<dyn Fn() -> Command + Send + Sync>,
     waiters: (
         mpsc::Sender<oneshot::Sender<()>>,
@@ -97,7 +97,7 @@ impl SubprocessPool {
 
         // Create initial processes
         for _ in 0..max_size {
-            let process = SubprocessWrapper::new(builder.clone())?;
+            let process = Subprocess::from_builder(builder.clone())?;
             processes.push_back(process);
         }
 
@@ -215,16 +215,16 @@ impl SubprocessPool {
         processes.len()
     }
 
-    fn spawn_process(&self, processes: &mut VecDeque<SubprocessWrapper>) -> Result<()> {
-        let process = SubprocessWrapper::new(self.builder.clone())?;
+    fn spawn_process(&self, processes: &mut VecDeque<Subprocess>) -> Result<()> {
+        let process = Subprocess::from_builder(self.builder.clone())?;
         processes.push_back(process);
         Ok(())
     }
 }
 
 pub struct PooledProcess {
-    process: Option<SubprocessWrapper>,
-    return_tx: mpsc::Sender<SubprocessWrapper>,
+    process: Option<Subprocess>,
+    return_tx: mpsc::Sender<Subprocess>,
     active_count: Arc<AtomicUsize>,
     pool: Arc<SubprocessPool>,
 }
@@ -287,14 +287,23 @@ impl SubprocessHandler for PooledProcess {
     }
 }
 
-pub struct SubprocessWrapper {
+pub struct Subprocess {
     child: Child,
     stdout_reader: Option<BufReader<tokio::process::ChildStdout>>,
 }
 
-impl SubprocessWrapper {
-    pub fn new(builder: Arc<dyn Fn() -> Command>) -> Result<Self> {
-        let mut command = (builder)();
+impl Subprocess {
+    pub fn new(builder: impl Fn() -> Command + 'static) -> Result<Self> {
+        let command = (builder)();
+        Self::from_command(command)
+    }
+
+    pub fn from_builder(builder: Arc<dyn Fn() -> Command>) -> Result<Self> {
+        let command = (builder)();
+        Self::from_command(command)
+    }
+
+    fn from_command(mut command: Command) -> Result<Self> {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
@@ -374,7 +383,7 @@ impl SubprocessWrapper {
     }
 }
 
-impl SubprocessHandler for SubprocessWrapper {
+impl SubprocessHandler for Subprocess {
     async fn write(&mut self, input: &str) -> Result<()> {
         self.write_bytes(input.as_bytes()).await
     }
@@ -713,5 +722,48 @@ mod tests {
         process.write_line("final_test").await.unwrap();
         let response = process.read_line().await.unwrap();
         assert_eq!(response.trim(), ">>final_test");
+    }
+
+    #[tokio::test]
+    async fn test_subprocess_direct() {
+        // Create a subprocess directly
+        let mut process = Subprocess::new(get_echo_binary).unwrap();
+
+        // Test basic write and read
+        process.write_line("hello world").await.unwrap();
+        let response = process.read_line().await.unwrap();
+        assert_eq!(response.trim(), ">>hello world");
+
+        // Test writing multiple lines
+        process.write_line("line 1").await.unwrap();
+        process.write_line("line 2").await.unwrap();
+
+        let resp1 = process.read_line().await.unwrap();
+        let resp2 = process.read_line().await.unwrap();
+        assert_eq!(resp1.trim(), ">>line 1");
+        assert_eq!(resp2.trim(), ">>line 2");
+
+        // Test writing raw bytes
+        process.write_bytes(b"raw bytes\n").await.unwrap();
+        let response = process.read_line().await.unwrap();
+        assert_eq!(response.trim(), ">>raw bytes");
+
+        // Test reading until delimiter
+        process.write_bytes(b"part1:part2\n").await.unwrap();
+        let response = process.read_bytes_until(b':').await.unwrap();
+        assert_eq!(&response, b">>part1:");
+
+        // Read the rest
+        let response = process.read_line().await.unwrap();
+        assert_eq!(response.trim(), "part2");
+
+        // Verify process is still alive
+        assert!(process.is_alive());
+
+        // Test closing stdin
+        process.close_stdin();
+        // Give the process a moment to exit
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(!process.is_alive());
     }
 }
