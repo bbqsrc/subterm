@@ -1,6 +1,4 @@
-use async_trait::async_trait;
 use std::{
-    any::Any,
     collections::VecDeque,
     io,
     sync::{
@@ -8,7 +6,6 @@ use std::{
         Arc,
     },
 };
-use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
@@ -16,56 +13,56 @@ use tokio::{
 };
 use tracing::error;
 
-#[derive(Error, Debug)]
-pub enum SubterminalError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    #[error("Channel send error")]
-    ChannelSend,
-    #[error("Pool is empty")]
-    EmptyPool,
-    #[error("UTF-8 error: {0}")]
-    Utf8(#[from] std::string::FromUtf8Error),
-    #[error("Invalid delimiter: must be exactly one byte")]
-    InvalidDelimiter,
-}
+pub type Result<T> = std::result::Result<T, std::io::Error>;
 
-pub type Result<T> = std::result::Result<T, SubterminalError>;
+pub trait SubprocessHandler: Send {
+    fn write_bytes(&mut self, input: &[u8])
+        -> impl std::future::Future<Output = Result<()>> + Send;
 
-#[async_trait]
-pub trait SubprocessHandler: Send + Sync + Any {
-    async fn write_bytes(&mut self, input: &[u8]) -> Result<()>;
-
-    async fn write(&mut self, input: &str) -> Result<()> {
-        self.write_bytes(input.as_bytes()).await
+    fn write(&mut self, input: &str) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { self.write_bytes(input.as_bytes()).await }
     }
 
-    async fn write_line(&mut self, input: &str) -> Result<()> {
-        self.write_bytes(format!("{}\n", input).as_bytes()).await
+    fn write_line(&mut self, input: &str) -> impl std::future::Future<Output = Result<()>> + Send {
+        async move {
+            self.write_bytes(input.as_bytes()).await?;
+            self.write_bytes(b"\n").await?;
+            Ok(())
+        }
     }
 
-    async fn read_bytes(&mut self) -> Result<Vec<u8>>;
+    fn read_bytes(&mut self) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
 
-    async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>>;
+    fn read_bytes_until(
+        &mut self,
+        delimiter: u8,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
 
-    async fn read(&mut self) -> Result<String> {
-        let bytes = self.read_bytes().await?;
-        String::from_utf8(bytes).map_err(|_| {
-            SubterminalError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid UTF-8 sequence",
-            ))
-        })
+    fn read(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
+        async {
+            let bytes = self.read_bytes().await?;
+            String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
+        }
     }
 
-    async fn read_line(&mut self) -> Result<String> {
-        let bytes = self.read_bytes_until(b'\n').await?;
-        String::from_utf8(bytes).map_err(|_| {
-            SubterminalError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid UTF-8 sequence",
-            ))
-        })
+    fn read_until(
+        &mut self,
+        delimiter: u8,
+    ) -> impl std::future::Future<Output = Result<String>> + Send {
+        async move {
+            let bytes = self.read_bytes_until(delimiter).await?;
+            String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
+        }
+    }
+
+    fn read_line(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
+        async {
+            let bytes = self.read_bytes_until(b'\n').await?;
+            String::from_utf8(bytes)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
+        }
     }
 
     fn is_alive(&mut self) -> bool;
@@ -247,25 +244,33 @@ impl Drop for PooledProcess {
     }
 }
 
-#[async_trait]
 impl SubprocessHandler for PooledProcess {
     async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
         let Some(process) = self.process.as_mut() else {
-            return Err(SubterminalError::ChannelSend);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "No process available",
+            ));
         };
         process.write_bytes(input).await
     }
 
     async fn read_bytes(&mut self) -> Result<Vec<u8>> {
         let Some(process) = self.process.as_mut() else {
-            return Err(SubterminalError::ChannelSend);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "No process available",
+            ));
         };
         process.read_bytes().await
     }
 
     async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
         let Some(process) = self.process.as_mut() else {
-            return Err(SubterminalError::ChannelSend);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "No process available",
+            ));
         };
         process.read_bytes_until(delimiter).await
     }
@@ -315,17 +320,14 @@ impl BasicSubprocessHandler {
             stdin.write_all(input).await?;
             stdin.flush().await?;
             if !self.is_alive() {
-                return Err(SubterminalError::Io(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "Process exited during write",
-                )));
+                ));
             }
             Ok(())
         } else {
-            Err(SubterminalError::Io(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "stdin is closed",
-            )))
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin is closed"))
         }
     }
 
@@ -334,17 +336,17 @@ impl BasicSubprocessHandler {
         if let Some(stdout) = self.stdout_reader.as_mut() {
             let bytes_read = stdout.read_to_end(&mut buf).await?;
             if bytes_read == 0 && !self.is_alive() {
-                return Err(SubterminalError::Io(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "Process exited during read",
-                )));
+                ));
             }
             Ok(buf)
         } else {
-            Err(SubterminalError::Io(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdout is closed",
-            )))
+            ))
         }
     }
 
@@ -353,17 +355,17 @@ impl BasicSubprocessHandler {
         if let Some(stdout) = self.stdout_reader.as_mut() {
             let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
             if bytes_read == 0 && !self.is_alive() {
-                return Err(SubterminalError::Io(io::Error::new(
+                return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "Process exited during read",
-                )));
+                ));
             }
             Ok(buf)
         } else {
-            Err(SubterminalError::Io(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdout is closed",
-            )))
+            ))
         }
     }
 
@@ -372,34 +374,27 @@ impl BasicSubprocessHandler {
     }
 }
 
-#[async_trait]
 impl SubprocessHandler for BasicSubprocessHandler {
     async fn write(&mut self, input: &str) -> Result<()> {
         self.write_bytes(input.as_bytes()).await
     }
 
     async fn write_line(&mut self, input: &str) -> Result<()> {
-        self.write_bytes(format!("{}\n", input).as_bytes()).await
+        self.write_bytes(input.as_bytes()).await?;
+        self.write_bytes(b"\n").await?;
+        Ok(())
     }
 
     async fn read(&mut self) -> Result<String> {
         let bytes = self.read_bytes().await?;
-        String::from_utf8(bytes).map_err(|_| {
-            SubterminalError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid UTF-8 sequence",
-            ))
-        })
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
     }
 
     async fn read_line(&mut self) -> Result<String> {
         let bytes = self.read_bytes_until(b'\n').await?;
-        String::from_utf8(bytes).map_err(|_| {
-            SubterminalError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid UTF-8 sequence",
-            ))
-        })
+        String::from_utf8(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
     }
 
     async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
@@ -495,7 +490,7 @@ mod tests {
 
         // Next operation should fail
         let result = process.write_line("test").await;
-        assert!(matches!(result, Err(SubterminalError::Io(_))));
+        assert!(matches!(result, Err(_)));
     }
 
     #[tokio::test]
@@ -513,7 +508,7 @@ mod tests {
 
         // Next operation should fail since process exited
         let result = process.write_line("test").await;
-        assert!(matches!(result, Err(SubterminalError::Io(_))));
+        assert!(matches!(result, Err(_)));
     }
 
     #[tokio::test]
@@ -526,7 +521,7 @@ mod tests {
         // Give the process time to write the invalid UTF-8 before exiting
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         let result = process.read_line().await;
-        assert!(matches!(result, Err(SubterminalError::Io(_))));
+        assert!(matches!(result, Err(_)));
     }
 
     #[tokio::test]
@@ -679,7 +674,7 @@ mod tests {
     async fn test_pool_spawn_failure() {
         // Try to create a pool with a non-existent binary
         let result = SubprocessPool::new("nonexistent_binary".to_string(), vec![], 2).await;
-        assert!(matches!(result, Err(SubterminalError::Io(_))));
+        assert!(matches!(result, Err(_)));
     }
 
     #[tokio::test]
@@ -695,11 +690,11 @@ mod tests {
 
         // Try to write - should fail since process exited
         let write_result = process.write_line("test").await;
-        assert!(matches!(write_result, Err(SubterminalError::Io(_))));
+        assert!(matches!(write_result, Err(_)));
 
         // Try to read - should fail since process exited
         let read_result = process.read_line().await;
-        assert!(matches!(read_result, Err(SubterminalError::Io(_))));
+        assert!(matches!(read_result, Err(_)));
     }
 
     #[tokio::test]
