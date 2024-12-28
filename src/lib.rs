@@ -71,31 +71,34 @@ pub trait SubprocessHandler: Send {
 }
 
 pub struct SubprocessPool {
-    cmd: String,
-    args: Vec<String>,
     max_size: usize,
-    processes: TokioMutex<VecDeque<BasicSubprocessHandler>>,
+    processes: TokioMutex<VecDeque<SubprocessWrapper>>,
     active_count: Arc<AtomicUsize>,
-    return_tx: mpsc::Sender<BasicSubprocessHandler>,
-    return_rx: TokioMutex<mpsc::Receiver<BasicSubprocessHandler>>,
+    return_tx: mpsc::Sender<SubprocessWrapper>,
+    return_rx: TokioMutex<mpsc::Receiver<SubprocessWrapper>>,
+    builder: Arc<dyn Fn() -> Command + Send + Sync>,
 }
 
 impl SubprocessPool {
     /// Create a new pool with the given command and arguments.
     /// The pool will start with `max_size` processes.
-    pub async fn new(cmd: String, args: Vec<String>, max_size: usize) -> Result<Arc<Self>> {
+    pub async fn new(
+        builder: impl Fn() -> Command + Send + Sync + 'static,
+        max_size: usize,
+    ) -> Result<Arc<Self>> {
         let (return_tx, return_rx) = mpsc::channel(max_size);
         let mut processes = VecDeque::with_capacity(max_size);
 
+        let builder = Arc::new(builder);
+
         // Create initial processes
         for _ in 0..max_size {
-            let process = BasicSubprocessHandler::new(&cmd, &args)?;
+            let process = SubprocessWrapper::new(builder.clone())?;
             processes.push_back(process);
         }
 
         Ok(Arc::new(Self {
-            cmd,
-            args,
+            builder,
             max_size,
             processes: TokioMutex::new(processes),
             active_count: Arc::new(AtomicUsize::new(0)),
@@ -212,16 +215,16 @@ impl SubprocessPool {
         processes.len()
     }
 
-    fn spawn_process(&self, processes: &mut VecDeque<BasicSubprocessHandler>) -> Result<()> {
-        let process = BasicSubprocessHandler::new(&self.cmd, &self.args)?;
+    fn spawn_process(&self, processes: &mut VecDeque<SubprocessWrapper>) -> Result<()> {
+        let process = SubprocessWrapper::new(self.builder.clone())?;
         processes.push_back(process);
         Ok(())
     }
 }
 
 pub struct PooledProcess {
-    process: Option<BasicSubprocessHandler>,
-    return_tx: mpsc::Sender<BasicSubprocessHandler>,
+    process: Option<SubprocessWrapper>,
+    return_tx: mpsc::Sender<SubprocessWrapper>,
     active_count: Arc<AtomicUsize>,
 }
 
@@ -286,15 +289,14 @@ impl SubprocessHandler for PooledProcess {
     }
 }
 
-pub struct BasicSubprocessHandler {
+pub struct SubprocessWrapper {
     child: Child,
     stdout_reader: Option<BufReader<tokio::process::ChildStdout>>,
 }
 
-impl BasicSubprocessHandler {
-    pub fn new(cmd: &str, args: &[String]) -> Result<Self> {
-        let mut command = Command::new(cmd);
-        command.args(args);
+impl SubprocessWrapper {
+    pub fn new(builder: Arc<dyn Fn() -> Command>) -> Result<Self> {
+        let mut command = (builder)();
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
@@ -374,7 +376,7 @@ impl BasicSubprocessHandler {
     }
 }
 
-impl SubprocessHandler for BasicSubprocessHandler {
+impl SubprocessHandler for SubprocessWrapper {
     async fn write(&mut self, input: &str) -> Result<()> {
         self.write_bytes(input.as_bytes()).await
     }
@@ -423,33 +425,30 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn get_echo_binary() -> (String, Vec<String>) {
+    fn get_echo_binary() -> Command {
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("target");
         path.push("debug");
         path.push("examples");
         path.push("echo");
-        (path.to_string_lossy().to_string(), vec![])
+        Command::new(path)
     }
 
     #[tokio::test]
     async fn test_pool_initialization() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 2).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
         assert_eq!(pool.count().await, 2);
     }
 
     #[tokio::test]
     async fn test_pool_write() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 2).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
         assert!(pool.write_line("test").await.is_ok());
     }
 
     #[tokio::test]
     async fn test_echo_interactive() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 1).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 1).await.unwrap();
 
         let mut process = pool.acquire().await.unwrap();
 
@@ -466,8 +465,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_line() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 1).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 1).await.unwrap();
 
         let mut process = pool.acquire().await.unwrap();
         process.write_line("test").await.unwrap();
@@ -477,8 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_echo_io_error() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 1).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 1).await.unwrap();
 
         let mut process = pool.acquire().await.unwrap();
         process.write_line("/io").await.unwrap();
@@ -495,8 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_echo_exit_code() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 1).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 1).await.unwrap();
 
         let mut process = pool.acquire().await.unwrap();
         process.write_line("/exit 42").await.unwrap();
@@ -513,8 +509,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_echo_invalid_utf8() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 1).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 1).await.unwrap();
 
         let mut process = pool.acquire().await.unwrap();
         process.write_line("/invalid-utf8").await.unwrap();
@@ -526,8 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_exhaustion_and_recreation() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 2).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
         let initial_count = pool.count().await;
         assert_eq!(initial_count, 2, "Pool should start with max size");
 
@@ -566,8 +560,8 @@ mod tests {
     #[tokio::test]
     async fn test_pool_all_processes_dead() {
         println!("Starting test_pool_all_processes_dead");
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 2).await.unwrap();
+
+        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
         println!("Pool created with 2 processes");
 
         // Kill all processes by making them exit
@@ -614,8 +608,8 @@ mod tests {
     #[tokio::test]
     async fn test_pool_multiple_acquires() {
         println!("Starting test");
-        let (cmd, args) = get_echo_binary();
-        let pool = Arc::new(SubprocessPool::new(cmd, args, 5).await.unwrap());
+
+        let pool = Arc::new(SubprocessPool::new(get_echo_binary, 5).await.unwrap());
         let concurrent_tasks = Arc::new(AtomicUsize::new(0));
         println!("Pool created");
 
@@ -673,14 +667,14 @@ mod tests {
     #[tokio::test]
     async fn test_pool_spawn_failure() {
         // Try to create a pool with a non-existent binary
-        let result = SubprocessPool::new("nonexistent_binary".to_string(), vec![], 2).await;
+        let result = SubprocessPool::new(|| Command::new("\0"), 2).await;
         assert!(matches!(result, Err(_)));
     }
 
     #[tokio::test]
     async fn test_pool_io_errors() {
         // Create a pool with 'false' command that exits immediately
-        let pool = SubprocessPool::new("false".to_string(), vec![], 1)
+        let pool = SubprocessPool::new(|| Command::new("false"), 1)
             .await
             .unwrap();
         let mut process = pool.acquire().await.unwrap();
@@ -699,8 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_write_line() {
-        let (cmd, args) = get_echo_binary();
-        let pool = SubprocessPool::new(cmd, args, 2).await.unwrap();
+        let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
         assert!(pool.write_line("test").await.is_ok());
     }
 }
