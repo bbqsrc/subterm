@@ -1,0 +1,13 @@
+[package]
+name = "subterminal"
+version = "0.1.0"
+edition = "2021"
+description = "A library for managing pools of interactive subprocesses"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.35", features = ["full"] }
+thiserror = "1.0"
+tracing = "0.1"
+async-trait = "0.1"
+futures = "0.3"
