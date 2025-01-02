@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     io,
+    process::Stdio,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -8,9 +9,10 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    process::{Child, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex as TokioMutex},
 };
+use tracing::{debug, error};
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -289,29 +291,31 @@ impl SubprocessHandler for PooledProcess {
 
 pub struct Subprocess {
     child: Child,
-    stdout_reader: Option<BufReader<tokio::process::ChildStdout>>,
+    stdin: Option<ChildStdin>,
+    stdout_reader: Option<BufReader<ChildStdout>>,
 }
 
 impl Subprocess {
     pub fn new(builder: impl Fn() -> Command + 'static) -> Result<Self> {
-        let command = (builder)();
-        Self::from_command(command)
+        Self::from_command(builder())
     }
 
     pub fn from_builder(builder: Arc<dyn Fn() -> Command>) -> Result<Self> {
-        let command = (builder)();
-        Self::from_command(command)
+        Self::from_command(builder())
     }
 
     fn from_command(mut command: Command) -> Result<Self> {
-        command.stdin(std::process::Stdio::piped());
-        command.stdout(std::process::Stdio::piped());
-        command.stderr(std::process::Stdio::piped());
-        let mut child = command.spawn()?;
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
+        let mut child = command.spawn()?;
+        let stdin = child.stdin.take();
         let stdout_reader = child.stdout.take().map(BufReader::new);
+
         Ok(Self {
             child,
+            stdin,
             stdout_reader,
         })
     }
@@ -325,61 +329,85 @@ impl Subprocess {
     }
 
     pub async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
-        if let Some(stdin) = self.child.stdin.as_mut() {
+        if !self.is_alive() {
+            debug!("Attempted to write to dead subprocess");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Process is no longer alive",
+            ));
+        }
+
+        if let Some(stdin) = &mut self.stdin {
+            debug!("Writing {} bytes to subprocess stdin", input.len());
             stdin.write_all(input).await?;
             stdin.flush().await?;
-            if !self.is_alive() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Process exited during write",
-                ));
-            }
             Ok(())
         } else {
-            Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin is closed"))
+            error!("Subprocess stdin is not available");
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stdin not available",
+            ))
         }
     }
 
     pub async fn read_bytes(&mut self) -> Result<Vec<u8>> {
+        if !self.is_alive() {
+            debug!("Attempted to read from dead subprocess");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Process is no longer alive",
+            ));
+        }
+
         let mut buf = Vec::new();
-        if let Some(stdout) = self.stdout_reader.as_mut() {
+        if let Some(stdout) = &mut self.stdout_reader {
+            debug!("Reading from subprocess stdout");
             let bytes_read = stdout.read_to_end(&mut buf).await?;
-            if bytes_read == 0 && !self.is_alive() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Process exited during read",
-                ));
-            }
+            debug!("Read {} bytes from subprocess stdout", bytes_read);
             Ok(buf)
         } else {
+            error!("Subprocess stdout is not available");
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "stdout is closed",
+                "stdout not available",
             ))
         }
     }
 
     pub async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
+        if !self.is_alive() {
+            debug!("Attempted to read_until from dead subprocess");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Process is no longer alive",
+            ));
+        }
+
         let mut buf = Vec::new();
-        if let Some(stdout) = self.stdout_reader.as_mut() {
+        if let Some(stdout) = &mut self.stdout_reader {
+            debug!(
+                "Reading until delimiter {:?} from subprocess stdout",
+                delimiter as char
+            );
             let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
-            if bytes_read == 0 && !self.is_alive() {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "Process exited during read",
-                ));
-            }
+            debug!(
+                "Read {} bytes until delimiter from subprocess stdout",
+                bytes_read
+            );
             Ok(buf)
         } else {
+            error!("Subprocess stdout is not available");
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "stdout is closed",
+                "stdout not available",
             ))
         }
     }
 
     pub fn close_stdin(&mut self) {
-        self.child.stdin.take();
+        debug!("Closing subprocess stdin");
+        self.stdin.take();
     }
 }
 
@@ -553,9 +581,9 @@ mod tests {
 
         // Verify we can still acquire and use a process
         let mut process = pool.acquire().await.unwrap();
-        process.write_line("test").await.unwrap();
+        process.write_line("final").await.unwrap();
         let response = process.read_line().await.unwrap();
-        assert_eq!(response, ">>test\n");
+        assert_eq!(response, ">>final\n");
     }
 
     #[tokio::test]
@@ -701,7 +729,12 @@ mod tests {
             .map(|i| {
                 let pool = pool.clone();
                 tokio::spawn(async move {
+                    println!("Task {} starting", i);
+
+                    // Acquire a process and use it
+                    println!("Task {} acquiring process", i);
                     let mut process = pool.acquire().await.unwrap();
+
                     // Write something unique to verify we got a valid process
                     process.write_line(&format!("task_{}", i)).await.unwrap();
                     let response = process.read_line().await.unwrap();
