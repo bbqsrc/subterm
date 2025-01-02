@@ -1,18 +1,19 @@
 use std::{
     collections::VecDeque,
     io,
+    pin::Pin,
     process::Stdio,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    task::{Context, Poll},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex as TokioMutex},
 };
-use tracing::{debug, error};
 
 pub type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -291,8 +292,9 @@ impl SubprocessHandler for PooledProcess {
 
 pub struct Subprocess {
     child: Child,
-    stdin: Option<ChildStdin>,
-    stdout_reader: Option<BufReader<ChildStdout>>,
+    stdin: Option<TracedStdin>,
+    stdout_reader: Option<BufReader<TracedStdout>>,
+    stderr_reader: Option<BufReader<TracedStderr>>,
 }
 
 impl Subprocess {
@@ -310,13 +312,15 @@ impl Subprocess {
         command.stderr(Stdio::piped());
 
         let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
-        let stdout_reader = child.stdout.take().map(BufReader::new);
+        let stdin = child.stdin.take().map(|inner| TracedStdin { inner });
+        let stdout_reader = child.stdout.take().map(|inner| BufReader::new(TracedStdout { inner }));
+        let stderr_reader = child.stderr.take().map(|inner| BufReader::new(TracedStderr { inner }));
 
         Ok(Self {
             child,
             stdin,
             stdout_reader,
+            stderr_reader,
         })
     }
 
@@ -330,7 +334,7 @@ impl Subprocess {
 
     pub async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
         if !self.is_alive() {
-            debug!("Attempted to write to dead subprocess");
+            tracing::debug!("Attempted to write to dead subprocess");
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "Process is no longer alive",
@@ -338,12 +342,12 @@ impl Subprocess {
         }
 
         if let Some(stdin) = &mut self.stdin {
-            debug!("Writing {} bytes to subprocess stdin", input.len());
+            tracing::debug!("Writing {} bytes to subprocess stdin", input.len());
             stdin.write_all(input).await?;
             stdin.flush().await?;
             Ok(())
         } else {
-            error!("Subprocess stdin is not available");
+            tracing::error!("Subprocess stdin is not available");
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdin not available",
@@ -353,7 +357,7 @@ impl Subprocess {
 
     pub async fn read_bytes(&mut self) -> Result<Vec<u8>> {
         if !self.is_alive() {
-            debug!("Attempted to read from dead subprocess");
+            tracing::debug!("Attempted to read from dead subprocess");
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "Process is no longer alive",
@@ -362,12 +366,12 @@ impl Subprocess {
 
         let mut buf = Vec::new();
         if let Some(stdout) = &mut self.stdout_reader {
-            debug!("Reading from subprocess stdout");
+            tracing::debug!("Reading from subprocess stdout");
             let bytes_read = stdout.read_to_end(&mut buf).await?;
-            debug!("Read {} bytes from subprocess stdout", bytes_read);
+            tracing::debug!("Read {} bytes from subprocess stdout", bytes_read);
             Ok(buf)
         } else {
-            error!("Subprocess stdout is not available");
+            tracing::error!("Subprocess stdout is not available");
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdout not available",
@@ -379,7 +383,7 @@ impl Subprocess {
         let mut buf = Vec::new();
 
         if let Some(mut stdout) = self.stdout_reader.take() {
-            debug!(
+            tracing::debug!(
                 "Reading until delimiter {:?} from subprocess stdout",
                 delimiter as char
             );
@@ -387,19 +391,19 @@ impl Subprocess {
             loop {
                 if !self.is_alive() {
                     if buf.is_empty() {
-                        debug!("Process is dead and no data was read");
+                        tracing::debug!("Process is dead and no data was read");
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "Process is no longer alive",
                         ));
                     }
                     // Return what we have if process died but we got some data
-                    debug!("Process died but returning {} bytes of data", buf.len());
+                    tracing::debug!("Process died but returning {} bytes of data", buf.len());
                     break;
                 }
 
                 let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
-                debug!(
+                tracing::debug!(
                     "Read {} bytes until delimiter from subprocess stdout",
                     bytes_read
                 );
@@ -419,7 +423,7 @@ impl Subprocess {
             self.stdout_reader = Some(stdout);
             Ok(buf)
         } else {
-            error!("Subprocess stdout is not available");
+            tracing::error!("Subprocess stdout is not available");
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdout not available",
@@ -428,7 +432,7 @@ impl Subprocess {
     }
 
     pub fn close_stdin(&mut self) {
-        debug!("Closing subprocess stdin");
+        tracing::debug!("Closing subprocess stdin");
         self.stdin.take();
     }
 }
@@ -474,6 +478,79 @@ impl SubprocessHandler for Subprocess {
 
     fn close_stdin(&mut self) {
         self.close_stdin()
+    }
+}
+
+pub struct TracedStdin {
+    inner: ChildStdin,
+}
+
+impl tokio::io::AsyncWrite for TracedStdin {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        tracing::debug!("Writing {} bytes to stdin", buf.len());
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = result {
+            tracing::debug!("Wrote {} bytes to stdin", n);
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        tracing::debug!("Flushing stdin");
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        tracing::debug!("Shutting down stdin");
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+pub struct TracedStdout {
+    inner: ChildStdout,
+}
+
+impl tokio::io::AsyncRead for TracedStdout {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = result {
+            let after = buf.filled().len();
+            let x = bstr::BStr::new(&buf.filled()[before..after]);
+            let bytes_read = after - before;
+            tracing::debug!("Read {} bytes from stdout", bytes_read);
+            tracing::trace!("Read from stdout: {}", x);
+        }
+        result
+    }
+}
+
+pub struct TracedStderr {
+    inner: ChildStderr,
+}
+
+impl tokio::io::AsyncRead for TracedStderr {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = result {
+            let after = buf.filled().len();
+            let bytes_read = after - before;
+            tracing::debug!("Read {} bytes from stderr", bytes_read);
+        }
+        result
     }
 }
 
@@ -573,6 +650,7 @@ mod tests {
     #[tokio::test]
     async fn test_pool_exhaustion_and_recreation() {
         let pool = SubprocessPool::new(get_echo_binary, 2).await.unwrap();
+
         let initial_count = pool.count().await;
         assert_eq!(initial_count, 2, "Pool should start with max size");
 

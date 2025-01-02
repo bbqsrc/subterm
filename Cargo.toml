@@ -6,7 +6,8 @@ description = "A library for managing pools of interactive subprocesses"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-tokio = { version = "1.35", default-features = false, features = ["io-util", "process", "sync"] }
+bstr = "1.11.3"
+tokio = { version = "1.35", default-features = false, features = ["io-util", "process", "sync", "time"] }
 tracing = { version = "0.1", default-features = false }
 
 [dev-dependencies]
