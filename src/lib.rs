@@ -69,6 +69,8 @@ pub trait SubprocessHandler: Send {
 
     fn is_alive(&mut self) -> bool;
 
+    fn flush(&mut self) -> impl std::future::Future<Output = Result<()>> + Send;
+
     fn close_stdin(&mut self);
 }
 
@@ -279,6 +281,13 @@ impl SubprocessHandler for PooledProcess {
         process.read_bytes_until(delimiter).await
     }
 
+    async fn flush(&mut self) -> Result<()> {
+        if let Some(stdin) = &mut self.process.as_mut().and_then(|x| x.stdin.as_mut()) {
+            stdin.flush().await?;
+        }
+        Ok(())
+    }
+
     fn is_alive(&mut self) -> bool {
         self.process.as_mut().map(|x| x.is_alive()).unwrap_or(false)
     }
@@ -313,8 +322,14 @@ impl Subprocess {
 
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().map(|inner| TracedStdin { inner });
-        let stdout_reader = child.stdout.take().map(|inner| BufReader::new(TracedStdout { inner }));
-        let stderr_reader = child.stderr.take().map(|inner| BufReader::new(TracedStderr { inner }));
+        let stdout_reader = child
+            .stdout
+            .take()
+            .map(|inner| BufReader::new(TracedStdout { inner }));
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|inner| BufReader::new(TracedStderr { inner }));
 
         Ok(Self {
             child,
@@ -344,7 +359,6 @@ impl Subprocess {
         if let Some(stdin) = &mut self.stdin {
             tracing::debug!("Writing {} bytes to subprocess stdin", input.len());
             stdin.write_all(input).await?;
-            stdin.flush().await?;
             Ok(())
         } else {
             tracing::error!("Subprocess stdin is not available");
@@ -439,12 +453,19 @@ impl Subprocess {
 
 impl SubprocessHandler for Subprocess {
     async fn write(&mut self, input: &str) -> Result<()> {
-        self.write_bytes(input.as_bytes()).await
+        self.write_bytes(input.as_bytes()).await?;
+        if let Some(stdin) = &mut self.stdin {
+            stdin.flush().await?;
+        }
+        Ok(())
     }
 
     async fn write_line(&mut self, input: &str) -> Result<()> {
         self.write_bytes(input.as_bytes()).await?;
         self.write_bytes(b"\n").await?;
+        if let Some(stdin) = &mut self.stdin {
+            stdin.flush().await?;
+        }
         Ok(())
     }
 
@@ -474,6 +495,13 @@ impl SubprocessHandler for Subprocess {
 
     fn is_alive(&mut self) -> bool {
         self.is_alive()
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if let Some(stdin) = &mut self.stdin {
+            stdin.flush().await?;
+        }
+        Ok(())
     }
 
     fn close_stdin(&mut self) {
