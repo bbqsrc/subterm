@@ -376,25 +376,47 @@ impl Subprocess {
     }
 
     pub async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
-        if !self.is_alive() {
-            debug!("Attempted to read_until from dead subprocess");
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "Process is no longer alive",
-            ));
-        }
-
         let mut buf = Vec::new();
-        if let Some(stdout) = &mut self.stdout_reader {
+
+        if let Some(mut stdout) = self.stdout_reader.take() {
             debug!(
                 "Reading until delimiter {:?} from subprocess stdout",
                 delimiter as char
             );
-            let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
-            debug!(
-                "Read {} bytes until delimiter from subprocess stdout",
-                bytes_read
-            );
+
+            loop {
+                if !self.is_alive() {
+                    if buf.is_empty() {
+                        debug!("Process is dead and no data was read");
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "Process is no longer alive",
+                        ));
+                    }
+                    // Return what we have if process died but we got some data
+                    debug!("Process died but returning {} bytes of data", buf.len());
+                    break;
+                }
+
+                let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
+                debug!(
+                    "Read {} bytes until delimiter from subprocess stdout",
+                    bytes_read
+                );
+
+                // If we found the delimiter or got some data, return it
+                // if bytes_read > 0 {
+                //     break;
+                // }
+                if buf.last() == Some(&delimiter) {
+                    break;
+                }
+
+                // No data read but process still alive - wait a bit and try again
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            self.stdout_reader = Some(stdout);
             Ok(buf)
         } else {
             error!("Subprocess stdout is not available");
