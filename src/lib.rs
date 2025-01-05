@@ -302,8 +302,9 @@ impl SubprocessHandler for PooledProcess {
 pub struct Subprocess {
     child: Child,
     stdin: Option<TracedStdin>,
-    stdout_reader: Option<BufReader<TracedStdout>>,
-    stderr_reader: Option<BufReader<TracedStderr>>,
+    stdout_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    stderr_rx: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    buffer: Vec<u8>,
 }
 
 impl Subprocess {
@@ -322,20 +323,57 @@ impl Subprocess {
 
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().map(|inner| TracedStdin { inner });
-        let stdout_reader = child
-            .stdout
-            .take()
-            .map(|inner| BufReader::new(TracedStdout { inner }));
-        let stderr_reader = child
-            .stderr
-            .take()
-            .map(|inner| BufReader::new(TracedStderr { inner }));
+
+        // Set up channels for stdout
+        let (stdout_tx, stdout_rx) = mpsc::unbounded_channel();
+        if let Some(stdout) = child.stdout.take() {
+            let stdout = TracedStdout { inner: stdout };
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                let mut buf = vec![0; 1024];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            if stdout_tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                drop(stdout_tx);
+            });
+        }
+
+        // Set up channels for stderr
+        let (stderr_tx, stderr_rx) = mpsc::unbounded_channel();
+        if let Some(stderr) = child.stderr.take() {
+            let stderr = TracedStderr { inner: stderr };
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stderr);
+                let mut buf = vec![0; 1024];
+                loop {
+                    match reader.read(&mut buf).await {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            if stderr_tx.send(buf[..n].to_vec()).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                drop(stderr_tx);
+            });
+        }
 
         Ok(Self {
             child,
             stdin,
-            stdout_reader,
-            stderr_reader,
+            stdout_rx: Some(stdout_rx),
+            stderr_rx: Some(stderr_rx),
+            buffer: Vec::new(),
         })
     }
 
@@ -378,71 +416,80 @@ impl Subprocess {
             ));
         }
 
-        let mut buf = Vec::new();
-        if let Some(stdout) = &mut self.stdout_reader {
-            tracing::debug!("Reading from subprocess stdout");
-            let bytes_read = stdout.read_to_end(&mut buf).await?;
-            tracing::debug!("Read {} bytes from subprocess stdout", bytes_read);
-            Ok(buf)
-        } else {
-            tracing::error!("Subprocess stdout is not available");
-            Err(io::Error::new(
+        let Some(rx) = &mut self.stdout_rx else {
+            return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdout not available",
-            ))
+            ));
+        };
+
+        if let Some(bytes) = rx.recv().await {
+            Ok(bytes)
+        } else {
+            Ok(vec![])
         }
     }
 
     pub async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        if !self.is_alive() {
+            tracing::debug!("Attempted to read from dead subprocess");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Process is no longer alive",
+            ));
+        }
 
-        if let Some(mut stdout) = self.stdout_reader.take() {
-            tracing::debug!(
-                "Reading until delimiter {:?} from subprocess stdout",
-                delimiter as char
-            );
-
-            loop {
-                if !self.is_alive() {
-                    if buf.is_empty() {
-                        tracing::debug!("Process is dead and no data was read");
-                        return Err(io::Error::new(
-                            io::ErrorKind::BrokenPipe,
-                            "Process is no longer alive",
-                        ));
-                    }
-                    // Return what we have if process died but we got some data
-                    tracing::debug!("Process died but returning {} bytes of data", buf.len());
-                    break;
-                }
-
-                let bytes_read = stdout.read_until(delimiter, &mut buf).await?;
-                tracing::debug!(
-                    "Read {} bytes until delimiter from subprocess stdout",
-                    bytes_read
-                );
-
-                // If we found the delimiter or got some data, return it
-                // if bytes_read > 0 {
-                //     break;
-                // }
-                if buf.last() == Some(&delimiter) {
-                    break;
-                }
-
-                // No data read but process still alive - wait a bit and try again
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-
-            self.stdout_reader = Some(stdout);
-            Ok(buf)
-        } else {
-            tracing::error!("Subprocess stdout is not available");
-            Err(io::Error::new(
+        let Some(rx) = &mut self.stdout_rx else {
+            return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stdout not available",
-            ))
+            ));
+        };
+
+        // First check if we already have the delimiter in our buffer
+        if let Some(pos) = self.buffer.iter().position(|&b| b == delimiter) {
+            let mut result = self.buffer.split_off(pos + 1);
+            std::mem::swap(&mut self.buffer, &mut result);
+            return Ok(result);
         }
+
+        loop {
+            match rx.recv().await {
+                Some(mut chunk) => {
+                    // Check the new chunk for delimiter
+                    if let Some(pos) = chunk.iter().position(|&b| b == delimiter) {
+                        // We found the delimiter in the new chunk
+                        let mut result = self.buffer.clone();
+                        let (before, after) = chunk.split_at(pos + 1);
+                        result.extend_from_slice(before);
+                        self.buffer = after.to_vec();
+                        return Ok(result);
+                    } else {
+                        // No delimiter in this chunk, append it all to buffer
+                        self.buffer.append(&mut chunk);
+                    }
+                }
+                None => {
+                    // Channel closed, return what we have
+                    let mut result = Vec::new();
+                    std::mem::swap(&mut self.buffer, &mut result);
+                    return Ok(result);
+                }
+            }
+        }
+    }
+
+    pub async fn read_line(&mut self) -> Result<String> {
+        let bytes = self.read_bytes_until(b'\n').await?;
+        if bytes.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Convert to string, trimming the trailing newline if present
+        let s =
+            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        Ok(s)
     }
 
     pub fn close_stdin(&mut self) {
@@ -471,14 +518,12 @@ impl SubprocessHandler for Subprocess {
 
     async fn read(&mut self) -> Result<String> {
         let bytes = self.read_bytes().await?;
-        String::from_utf8(bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn read_line(&mut self) -> Result<String> {
         let bytes = self.read_bytes_until(b'\n').await?;
-        String::from_utf8(bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     async fn write_bytes(&mut self, input: &[u8]) -> Result<()> {
@@ -900,7 +945,9 @@ mod tests {
         process.write_line("line 2").await.unwrap();
 
         let resp1 = process.read_line().await.unwrap();
+        println!("1: {}", resp1);
         let resp2 = process.read_line().await.unwrap();
+        println!("2: {}", resp2);
         assert_eq!(resp1.trim(), ">>line 1");
         assert_eq!(resp2.trim(), ">>line 2");
 
