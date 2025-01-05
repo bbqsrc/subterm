@@ -11,7 +11,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot, Mutex as TokioMutex},
 };
@@ -431,6 +431,29 @@ impl Subprocess {
         }
     }
 
+    pub async fn read_bytes_err(&mut self) -> Result<Vec<u8>> {
+        if !self.is_alive() {
+            tracing::debug!("Attempted to read from dead subprocess");
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Process is no longer alive",
+            ));
+        }
+
+        let Some(rx) = &mut self.stderr_rx else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "stderr not available",
+            ));
+        };
+
+        if let Some(bytes) = rx.recv().await {
+            Ok(bytes)
+        } else {
+            Ok(vec![])
+        }
+    }
+
     pub async fn read_bytes_until(&mut self, delimiter: &[u8]) -> Result<Vec<u8>> {
         if !self.is_alive() {
             tracing::debug!("Attempted to read from dead subprocess");
@@ -451,7 +474,7 @@ impl Subprocess {
 
         // First check if we already have the delimiter in our buffer
         if let Some(pos) = finder.find(&self.buffer) {
-            let mut remaining = self.buffer.split_off(pos + delimiter.len());
+            let remaining = self.buffer.split_off(pos + delimiter.len());
             let mut result = Vec::new();
             std::mem::swap(&mut self.buffer, &mut result);
             self.buffer = remaining;
@@ -467,8 +490,8 @@ impl Subprocess {
 
                     // Check for delimiter in the combined buffer
                     if let Some(pos) = finder.find(&temp) {
-                        let mut remaining = temp.split_off(pos + delimiter.len());
-                        let mut result = temp;
+                        let remaining = temp.split_off(pos + delimiter.len());
+                        let result = temp;
                         self.buffer = remaining;
                         return Ok(result);
                     } else {
