@@ -1,3 +1,4 @@
+use memchr::memmem;
 use std::{
     collections::VecDeque,
     io,
@@ -37,7 +38,7 @@ pub trait SubprocessHandler: Send {
 
     fn read_bytes_until(
         &mut self,
-        delimiter: u8,
+        delimiter: &[u8],
     ) -> impl std::future::Future<Output = Result<Vec<u8>>> + Send;
 
     fn read(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
@@ -50,7 +51,7 @@ pub trait SubprocessHandler: Send {
 
     fn read_until(
         &mut self,
-        delimiter: u8,
+        delimiter: &[u8],
     ) -> impl std::future::Future<Output = Result<String>> + Send {
         async move {
             let bytes = self.read_bytes_until(delimiter).await?;
@@ -61,7 +62,7 @@ pub trait SubprocessHandler: Send {
 
     fn read_line(&mut self) -> impl std::future::Future<Output = Result<String>> + Send {
         async {
-            let bytes = self.read_bytes_until(b'\n').await?;
+            let bytes = self.read_bytes_until(b"\n").await?;
             String::from_utf8(bytes)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 sequence"))
         }
@@ -271,7 +272,7 @@ impl SubprocessHandler for PooledProcess {
         process.read_bytes().await
     }
 
-    async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
+    async fn read_bytes_until(&mut self, delimiter: &[u8]) -> Result<Vec<u8>> {
         let Some(process) = self.process.as_mut() else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -430,7 +431,7 @@ impl Subprocess {
         }
     }
 
-    pub async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
+    pub async fn read_bytes_until(&mut self, delimiter: &[u8]) -> Result<Vec<u8>> {
         if !self.is_alive() {
             tracing::debug!("Attempted to read from dead subprocess");
             return Err(io::Error::new(
@@ -446,26 +447,32 @@ impl Subprocess {
             ));
         };
 
+        let finder = memmem::Finder::new(delimiter);
+
         // First check if we already have the delimiter in our buffer
-        if let Some(pos) = self.buffer.iter().position(|&b| b == delimiter) {
-            let mut result = self.buffer.split_off(pos + 1);
+        if let Some(pos) = finder.find(&self.buffer) {
+            let mut remaining = self.buffer.split_off(pos + delimiter.len());
+            let mut result = Vec::new();
             std::mem::swap(&mut self.buffer, &mut result);
+            self.buffer = remaining;
             return Ok(result);
         }
 
         loop {
             match rx.recv().await {
                 Some(mut chunk) => {
-                    // Check the new chunk for delimiter
-                    if let Some(pos) = chunk.iter().position(|&b| b == delimiter) {
-                        // We found the delimiter in the new chunk
-                        let mut result = self.buffer.clone();
-                        let (before, after) = chunk.split_at(pos + 1);
-                        result.extend_from_slice(before);
-                        self.buffer = after.to_vec();
+                    // Create a temporary buffer that includes existing buffer and new chunk
+                    let mut temp = self.buffer.clone();
+                    temp.extend_from_slice(&chunk);
+
+                    // Check for delimiter in the combined buffer
+                    if let Some(pos) = finder.find(&temp) {
+                        let mut remaining = temp.split_off(pos + delimiter.len());
+                        let mut result = temp;
+                        self.buffer = remaining;
                         return Ok(result);
                     } else {
-                        // No delimiter in this chunk, append it all to buffer
+                        // No delimiter found, store everything in buffer
                         self.buffer.append(&mut chunk);
                     }
                 }
@@ -480,7 +487,7 @@ impl Subprocess {
     }
 
     pub async fn read_line(&mut self) -> Result<String> {
-        let bytes = self.read_bytes_until(b'\n').await?;
+        let bytes = self.read_bytes_until(b"\n").await?;
         if bytes.is_empty() {
             return Ok(String::new());
         }
@@ -522,7 +529,7 @@ impl SubprocessHandler for Subprocess {
     }
 
     async fn read_line(&mut self) -> Result<String> {
-        let bytes = self.read_bytes_until(b'\n').await?;
+        let bytes = self.read_bytes_until(b"\n").await?;
         String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
@@ -534,7 +541,7 @@ impl SubprocessHandler for Subprocess {
         self.read_bytes().await
     }
 
-    async fn read_bytes_until(&mut self, delimiter: u8) -> Result<Vec<u8>> {
+    async fn read_bytes_until(&mut self, delimiter: &[u8]) -> Result<Vec<u8>> {
         self.read_bytes_until(delimiter).await
     }
 
@@ -958,7 +965,7 @@ mod tests {
 
         // Test reading until delimiter
         process.write_bytes(b"part1:part2\n").await.unwrap();
-        let response = process.read_bytes_until(b':').await.unwrap();
+        let response = process.read_bytes_until(b":").await.unwrap();
         assert_eq!(&response, b">>part1:");
 
         // Read the rest

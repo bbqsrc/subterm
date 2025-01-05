@@ -231,6 +231,7 @@ version = "0.0.1"
 dependencies = [
  "bstr",
  "futures-util",
+ "memchr",
  "tokio",
  "tracing",
 ]
